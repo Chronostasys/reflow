@@ -13,30 +13,20 @@ var (
 	defaultNewline     = []rune{'\n'}
 )
 
-var (
-	lineStartProhibited = map[rune]bool{
-		'，': true, '。': true, '！': true, '？': true,
-		'、': true, '：': true, '；': true,
-		'）': true, '】': true, '」': true, '』': true, '》': true,
-		'〕': true, '〉': true, '．': true,
-		',': true, '.': true, '!': true, '?': true,
-		')': true, ']': true,
-	}
-	lineEndProhibited = map[rune]bool{
-		'（': true, '【': true, '「': true, '『': true, '《': true,
-		'〔': true, '〈': true,
-		'(': true, '[': true,
-	}
-)
-
+// isCJK returns true for characters that follow CJK line-breaking rules:
+// each character is a valid line-break point. Covers CJK Unified Ideographs,
+// Hiragana, Katakana, Hangul, and CJK punctuation.
 func isCJK(r rune) bool {
 	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana,
-		unicode.Hangul) ||
-		(r >= 0x3000 && r <= 0x303F) ||
-		(r >= 0xFF01 && r <= 0xFF60) ||
-		(r >= 0xFFE0 && r <= 0xFFE6)
+		unicode.Hangul, unicode.Lm, unicode.Nl) ||
+		(r >= 0x3000 && r <= 0x303F) || // CJK Symbols and Punctuation
+		(r >= 0xFF01 && r <= 0xFF60) || // Halfwidth and Fullwidth Forms (punct)
+		(r >= 0xFFE0 && r <= 0xFFE6) // Fullwidth signs
 }
 
+// WordWrap contains settings and state for customisable text reflowing with
+// support for ANSI escape sequences. This means you can style your terminal
+// output without affecting the word wrapping algorithm.
 type WordWrap struct {
 	Limit        int
 	Breakpoints  []rune
@@ -47,11 +37,12 @@ type WordWrap struct {
 	space bytes.Buffer
 	word  ansi.Buffer
 
-	lineLen       int
-	ansi          bool
-	pendingBreak bool
+	lineLen int
+	ansi    bool
 }
 
+// NewWriter returns a new instance of a word-wrapping writer, initialized with
+// default settings.
 func NewWriter(limit int) *WordWrap {
 	return &WordWrap{
 		Limit:        limit,
@@ -61,13 +52,18 @@ func NewWriter(limit int) *WordWrap {
 	}
 }
 
+// Bytes is shorthand for declaring a new default WordWrap instance,
+// used to immediately word-wrap a byte slice.
 func Bytes(b []byte, limit int) []byte {
 	f := NewWriter(limit)
 	_, _ = f.Write(b)
 	_ = f.Close()
+
 	return f.Bytes()
 }
 
+// String is shorthand for declaring a new default WordWrap instance,
+// used to immediately word-wrap a string.
 func String(s string, limit int) string {
 	return string(Bytes([]byte(s), limit))
 }
@@ -102,36 +98,7 @@ func inGroup(a []rune, c rune) bool {
 	return false
 }
 
-func (w *WordWrap) currentLineLen() int {
-	return w.lineLen + w.space.Len() + w.word.PrintableRuneWidth()
-}
-
-// firstWordRune returns the first non-ANSI rune in the word buffer.
-func (w *WordWrap) firstWordRune() rune {
-	for _, r := range w.word.String() {
-		if r == '\x1B' { continue }
-		if r >= 0x40 && r <= 0x5a || r >= 0x61 && r <= 0x7a { continue }
-		return r
-	}
-	return 0
-}
-
-// canBreak checks if it's kinsoku-safe to put a newline before the word buffer,
-// with 'incoming' being the next character after it.
-func (w *WordWrap) canBreak(incoming rune) bool {
-	first := w.firstWordRune()
-	if first != 0 && lineStartProhibited[first] {
-		return false
-	}
-	if first != 0 && lineEndProhibited[first] {
-		return false
-	}
-	if lineStartProhibited[incoming] {
-		return false
-	}
-	return true
-}
-
+// Write is used to write more content to the word-wrap buffer.
 func (w *WordWrap) Write(b []byte) (int, error) {
 	if w.Limit == 0 {
 		return w.buf.Write(b)
@@ -142,71 +109,73 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 		s = strings.Replace(strings.TrimSpace(s), "\n", " ", -1)
 	}
 
+	// Track the previous rune to detect CJK↔non-CJK boundaries.
 	var prevCJK bool
+	// We need to know if we just flushed a word (to detect CJK boundary).
+	// We track prevCJK outside the loop so CJK boundary detection works
+	// across iterations.
 
 	for _, c := range s {
 		if c == '\x1B' {
-			w.flushPending()
+			// ANSI escape sequence
 			_, _ = w.word.WriteRune(c)
 			w.ansi = true
 		} else if w.ansi {
 			_, _ = w.word.WriteRune(c)
 			if (c >= 0x40 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) {
+				// ANSI sequence terminated
 				w.ansi = false
 			}
 		} else if inGroup(w.Newline, c) {
-			w.flushPending()
+			// end of current line
+			// see if we can add the content of the space buffer to the current line
 			if w.word.Len() == 0 {
 				if w.lineLen+w.space.Len() > w.Limit {
 					w.lineLen = 0
 				} else {
+					// preserve whitespace
 					_, _ = w.buf.Write(w.space.Bytes())
 				}
 				w.space.Reset()
 			}
+
 			w.addWord()
 			w.addNewLine()
 			prevCJK = false
 		} else if unicode.IsSpace(c) {
-			w.flushPending()
+			// end of current word
 			w.addWord()
 			_, _ = w.space.WriteRune(c)
 			prevCJK = false
 		} else if inGroup(w.Breakpoints, c) {
-			w.flushPending()
+			// valid breakpoint
 			w.addSpace()
 			w.addWord()
 			_, _ = w.buf.WriteRune(c)
 			prevCJK = false
 		} else {
+			// CJK line-breaking: each CJK character is a valid break point.
+			// Break at CJK↔non-CJK boundaries and after each CJK char.
 			cjk := isCJK(c)
-
 			if cjk != prevCJK && w.word.PrintableRuneWidth() > 0 {
+				// CJK↔non-CJK boundary: flush current word before this char
 				w.addWord()
 			}
 			_, _ = w.word.WriteRune(c)
 			prevCJK = cjk
 
 			if cjk {
-				if w.pendingBreak {
-					if w.canBreak(c) {
-						w.addNewLine()
-						w.pendingBreak = false
-					w.addWord()
-					} else {
-						w.pendingBreak = false
-					w.addWord()
-					}
-				}
-
-				if w.currentLineLen() > w.Limit &&
+				// CJK char: each char is a break point.
+				// Check if adding this char would exceed the limit.
+				// If so, newline first, then flush the single-char word.
+				if w.lineLen+w.space.Len()+w.word.PrintableRuneWidth() > w.Limit &&
 					w.word.PrintableRuneWidth() < w.Limit {
-					w.pendingBreak = true
-				} else {
-					w.addWord()
+					w.addNewLine()
 				}
-			} else if w.currentLineLen() > w.Limit &&
+				w.addWord()
+			} else if w.lineLen+w.space.Len()+w.word.PrintableRuneWidth() > w.Limit &&
 				w.word.PrintableRuneWidth() < w.Limit {
+				// Non-CJK word: add a line break if it would exceed the limit
 				w.addNewLine()
 			}
 		}
@@ -215,24 +184,19 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (w *WordWrap) flushPending() {
-	if w.pendingBreak {
-		w.addNewLine()
-		w.pendingBreak = false
-					w.addWord()
-	}
-}
-
+// Close will finish the word-wrap operation. Always call it before trying to
+// retrieve the final result.
 func (w *WordWrap) Close() error {
-	w.flushPending()
 	w.addWord()
 	return nil
 }
 
+// Bytes returns the word-wrapped result as a byte slice.
 func (w *WordWrap) Bytes() []byte {
 	return w.buf.Bytes()
 }
 
+// String returns the word-wrapped result as a string.
 func (w *WordWrap) String() string {
 	return w.buf.String()
 }
