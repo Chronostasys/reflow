@@ -2,6 +2,7 @@ package wordwrap
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"unicode"
 
@@ -59,6 +60,7 @@ type WordWrap struct {
 }
 
 func NewWriter(limit int) *WordWrap {
+	fmt.Printf("[REFLOW] NewWriter limit=%d\n", limit)
 	return &WordWrap{
 		Limit:        limit,
 		Breakpoints:  defaultBreakpoints,
@@ -128,6 +130,7 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 	}
 
 	s := string(b)
+	// DEBUG: fmt.Printf("[REFLOW] Write len=%d first20=%q lineLen=%d pending=%v\n", len(b), string(b[:min(20,len(b))]), w.lineLen, w.pendingBreak)
 	if !w.KeepNewlines {
 		s = strings.Replace(strings.TrimSpace(s), "\n", " ", -1)
 	}
