@@ -2,7 +2,6 @@ package wordwrap
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
 	"unicode"
 
@@ -30,8 +29,6 @@ var (
 	}
 )
 
-const cjkMaxOverhang = 20
-
 func isCJK(r rune) bool {
 	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana,
 		unicode.Hangul) ||
@@ -50,13 +47,18 @@ type WordWrap struct {
 	space bytes.Buffer
 	word  ansi.Buffer
 
-	lineLen      int
-	ansi         bool
-	pendingBreak bool
+	lineLen int
+	ansi    bool
+
+	// CJK kinsoku state: when the soft limit is exceeded, we defer the line
+	// break to look for a better position. Instead of a simple boolean, we
+	// track the deferred word separately so the main word buffer can be
+	// flushed normally.
+	deferred      bytes.Buffer // chars deferred during kinsoku lookahead
+	deferredWidth int          // display width of deferred chars
 }
 
 func NewWriter(limit int) *WordWrap {
-	fmt.Printf("[REFLOW] NewWriter(limit=%d)\n", limit)
 	return &WordWrap{
 		Limit:        limit,
 		Breakpoints:  defaultBreakpoints,
@@ -110,23 +112,32 @@ func (w *WordWrap) currentLineLen() int {
 	return w.lineLen + w.space.Len() + w.word.PrintableRuneWidth()
 }
 
-func (w *WordWrap) flushPendingBreak() {
-	if w.pendingBreak {
-		w.addNewLine()
-		w.pendingBreak = false
+// flushDeferred moves deferred chars to the current line (absorbs them).
+func (w *WordWrap) flushDeferred() {
+	if w.deferred.Len() > 0 {
+		w.lineLen += w.deferredWidth
+		_, _ = w.buf.Write(w.deferred.Bytes())
+		w.deferred.Reset()
+		w.deferredWidth = 0
 	}
 }
 
+// breakDeferred starts a new line and puts deferred chars on it.
+func (w *WordWrap) breakDeferred() {
+	w.addNewLine()
+	w.flushDeferred()
+}
+
+// hasDeferred returns true if we're in kinsoku lookahead mode.
+func (w *WordWrap) hasDeferred() bool {
+	return w.deferred.Len() > 0
+}
+
+// Write is used to write more content to the word-wrap buffer.
 func (w *WordWrap) Write(b []byte) (int, error) {
 	if w.Limit == 0 {
 		return w.buf.Write(b)
 	}
-
-	preview := string(b)
-	if len(preview) > 40 {
-		preview = preview[:40] + "..."
-	}
-	fmt.Printf("[REFLOW] Write(%d bytes) lineLen=%d pending=%v preview=%q\n", len(b), w.lineLen, w.pendingBreak, preview)
 
 	s := string(b)
 	if !w.KeepNewlines {
@@ -137,7 +148,10 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 
 	for _, c := range s {
 		if c == '\x1B' {
-			w.flushPendingBreak()
+			if w.hasDeferred() {
+				// ANSI during deferred — break now, flush deferred to new line
+				w.breakDeferred()
+			}
 			_, _ = w.word.WriteRune(c)
 			w.ansi = true
 		} else if w.ansi {
@@ -146,7 +160,7 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 				w.ansi = false
 			}
 		} else if inGroup(w.Newline, c) {
-			w.pendingBreak = false
+			w.flushDeferred()
 			if w.word.Len() == 0 {
 				if w.lineLen+w.space.Len() > w.Limit {
 					w.lineLen = 0
@@ -159,12 +173,25 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 			w.addNewLine()
 			prevCJK = false
 		} else if unicode.IsSpace(c) {
-			w.flushPendingBreak()
+			// Space = natural break point.
+			// If deferred: decide where to break.
+			if w.hasDeferred() {
+				// The deferred chars + current line fit? Break before deferred.
+				if w.lineLen+w.deferredWidth <= w.Limit {
+					// Deferred chars start a new line
+					w.breakDeferred()
+				} else {
+					// Absorb deferred into current line
+					w.flushDeferred()
+				}
+			}
 			w.addWord()
 			_, _ = w.space.WriteRune(c)
 			prevCJK = false
 		} else if inGroup(w.Breakpoints, c) {
-			w.flushPendingBreak()
+			if w.hasDeferred() {
+				w.breakDeferred()
+			}
 			w.addSpace()
 			w.addWord()
 			_, _ = w.buf.WriteRune(c)
@@ -175,29 +202,46 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 			if cjk != prevCJK && w.word.PrintableRuneWidth() > 0 {
 				w.addWord()
 			}
-
-			if w.pendingBreak {
-				hardLimit := w.Limit + cjkMaxOverhang
-				if w.currentLineLen()+runeWidth(c) > hardLimit && !lineStartProhibited[c] {
-					w.addNewLine()
-					w.pendingBreak = false
-				}
-			}
-
 			_, _ = w.word.WriteRune(c)
 			prevCJK = cjk
 
 			if cjk {
 				prohibitBreak := lineEndProhibited[c]
 
-				if !prohibitBreak && w.currentLineLen() > w.Limit &&
+				if w.hasDeferred() {
+					// Already in kinsoku lookahead.
+					// Add this char to deferred buffer.
+					w.deferred.WriteRune(c)
+					rw := 2 // CJK width
+					w.deferredWidth += rw
+
+					if lineStartProhibited[c] {
+						// Can't break before this char — keep deferring
+					} else if w.lineLen+w.deferredWidth <= w.Limit {
+						// Deferred content fits on current line — absorb it
+						w.flushDeferred()
+					} else if w.lineLen+w.deferredWidth <= w.Limit+20 {
+						// Deferred content slightly exceeds — keep deferring for now
+						// (look for a better break point)
+					} else {
+						// Deferred content way exceeds — break before deferred
+						w.breakDeferred()
+					}
+				} else if !prohibitBreak && w.currentLineLen() > w.Limit &&
 					w.word.PrintableRuneWidth() < w.Limit {
-					w.pendingBreak = true
+					// Soft limit exceeded — start kinsoku deferral.
+					// Move the current char from word to deferred buffer.
+					w.deferred.WriteRune(c)
+					w.deferredWidth += 2
+					w.word.Reset() // remove char from word
 				} else {
 					w.addWord()
 				}
 			} else if w.currentLineLen() > w.Limit &&
 				w.word.PrintableRuneWidth() < w.Limit {
+				if w.hasDeferred() {
+					w.breakDeferred()
+				}
 				w.addNewLine()
 			}
 		}
@@ -206,15 +250,16 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func runeWidth(r rune) int {
-	if r >= 0x7F {
-		return 2
-	}
-	return 1
-}
-
+// Close finishes the word-wrap operation.
 func (w *WordWrap) Close() error {
-	w.flushPendingBreak()
+	if w.hasDeferred() {
+		// Decide: absorb or break
+		if w.lineLen+w.deferredWidth <= w.Limit+20 {
+			w.flushDeferred()
+		} else {
+			w.breakDeferred()
+		}
+	}
 	w.addWord()
 	return nil
 }
