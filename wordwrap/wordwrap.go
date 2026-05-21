@@ -129,6 +129,7 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 		} else if inGroup(w.Breakpoints, c) {
 			w.addSpace()
 			w.addWord()
+			w.lineLen++
 			_, _ = w.buf.WriteRune(c)
 			prevCJK = false
 		} else {
