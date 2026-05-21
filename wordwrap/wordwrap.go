@@ -13,7 +13,7 @@ var (
 	defaultNewline     = []rune{'\n'}
 )
 
-// CJK line-breaking prohibition rules (避头尾规则).
+// CJK line-breaking rules (避头尾规则).
 var (
 	lineStartProhibited = map[rune]bool{
 		'，': true, '。': true, '！': true, '？': true,
@@ -29,6 +29,11 @@ var (
 		'(': true, '[': true,
 	}
 )
+
+// cjkMaxOverhang is the maximum number of extra display columns a CJK line
+// may exceed the soft limit while looking for a better break point.
+// This prevents infinite accumulation when there's no natural break point.
+const cjkMaxOverhang = 20
 
 func isCJK(r rune) bool {
 	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana,
@@ -107,6 +112,15 @@ func (w *WordWrap) currentLineLen() int {
 	return w.lineLen + w.space.Len() + w.word.PrintableRuneWidth()
 }
 
+// flushPendingBreak executes a deferred line break, moving the buffered
+// word to a new line.
+func (w *WordWrap) flushPendingBreak() {
+	if w.pendingBreak {
+		w.addNewLine()
+		w.pendingBreak = false
+	}
+}
+
 // Write is used to write more content to the word-wrap buffer.
 func (w *WordWrap) Write(b []byte) (int, error) {
 	if w.Limit == 0 {
@@ -122,11 +136,7 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 
 	for _, c := range s {
 		if c == '\x1B' {
-			// Flush pending break before ANSI sequences
-			if w.pendingBreak {
-				w.addNewLine()
-				w.pendingBreak = false
-			}
+			w.flushPendingBreak()
 			_, _ = w.word.WriteRune(c)
 			w.ansi = true
 		} else if w.ansi {
@@ -148,19 +158,13 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 			w.addNewLine()
 			prevCJK = false
 		} else if unicode.IsSpace(c) {
-			// Flush pending break at word boundary (space)
-			if w.pendingBreak {
-				w.addNewLine()
-				w.pendingBreak = false
-			}
+			// Space is a natural word boundary — break here if pending.
+			w.flushPendingBreak()
 			w.addWord()
 			_, _ = w.space.WriteRune(c)
 			prevCJK = false
 		} else if inGroup(w.Breakpoints, c) {
-			if w.pendingBreak {
-				w.addNewLine()
-				w.pendingBreak = false
-			}
+			w.flushPendingBreak()
 			w.addSpace()
 			w.addWord()
 			_, _ = w.buf.WriteRune(c)
@@ -171,6 +175,18 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 			if cjk != prevCJK && w.word.PrintableRuneWidth() > 0 {
 				w.addWord()
 			}
+
+			if w.pendingBreak {
+				hardLimit := w.Limit + cjkMaxOverhang
+				if w.currentLineLen()+runeWidth(c) > hardLimit && !lineStartProhibited[c] {
+					// Hard limit exceeded — force the deferred break.
+					// The buffered word goes to a new line.
+					w.addNewLine()
+					w.pendingBreak = false
+				}
+				// Otherwise: keep deferring (accumulate in word buffer).
+			}
+
 			_, _ = w.word.WriteRune(c)
 			prevCJK = cjk
 
@@ -179,9 +195,8 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 
 				if !prohibitBreak && w.currentLineLen() > w.Limit &&
 					w.word.PrintableRuneWidth() < w.Limit {
-					// Don't flush word — keep it in buffer.
-					// On the next character, we'll decide whether to break
-					// (if next char is line-start-prohibited, absorb into current line).
+					// Soft limit exceeded — defer the break.
+					// Word stays in buffer; we'll look for a better break point.
 					w.pendingBreak = true
 				} else {
 					w.addWord()
@@ -196,12 +211,17 @@ func (w *WordWrap) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// runeWidth returns the display width of a single rune.
+func runeWidth(r rune) int {
+	if r >= 0x7F {
+		return 2
+	}
+	return 1
+}
+
 // Close finishes the word-wrap operation.
 func (w *WordWrap) Close() error {
-	if w.pendingBreak {
-		w.addNewLine()
-		w.pendingBreak = false
-	}
+	w.flushPendingBreak()
 	w.addWord()
 	return nil
 }
